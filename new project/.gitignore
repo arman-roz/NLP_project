@@ -1,0 +1,37 @@
+# Raw paper cache (HTML/PDF files, can be large)
+data/cache/
+
+# Pipeline output (generated files, not source)
+data/output/
+
+# Test exports
+testing exports/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.env/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# IDE files
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.log
