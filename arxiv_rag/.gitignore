@@ -1,0 +1,30 @@
+# Cache directories
+data/cache/
+data/embeddings/
+
+# Output files
+data/output/dataset.json
+*.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test outputs
+test_output.json

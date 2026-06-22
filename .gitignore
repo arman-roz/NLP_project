@@ -24,3 +24,32 @@ Thumbs.db
 
 # Sensitive / local config
 .env
+
+# All PDF files
+*.pdf
+
+# archives
+*.zip
+
+# model files
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.pkl
+
+# data/cache/model folders
+arxiv_rag/data/cache/
+arxiv_rag/data/embeddings/
+modified/data/cache/
+modified/data/model_cache/
+
+# common generated folders
+__pycache__/
+.ipynb_checkpoints/
+.env
+venv/
+env/
+outputs/
+checkpoints/
+models/

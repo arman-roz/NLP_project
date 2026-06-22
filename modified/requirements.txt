@@ -1,0 +1,8 @@
+requests>=2.32
+beautifulsoup4>=4.12
+lxml>=5.3
+spacy>=3.8,<3.9
+transformers>=4.44
+torch>=2.3
+numpy>=1.26
+tqdm>=4.66

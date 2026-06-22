@@ -1,0 +1,10 @@
+requests
+beautifulsoup4
+lxml
+spacy
+numpy
+torch
+transformers
+rank_bm25
+sentence-transformers
+tqdm
