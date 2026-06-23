@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import pypdf; r=pypdf.PdfReader\\('pra_nlp_s26.pdf'\\); print\\('\\\\n'.join\\(p.extract_text\\(\\) for p in r.pages\\)\\)\")",
+      "Bash(python -c \"import PyPDF2; r=PyPDF2.PdfReader\\('pra_nlp_s26.pdf'\\); print\\('\\\\n'.join\\(p.extract_text\\(\\) for p in r.pages\\)\\)\")",
+      "Bash(python -c \"import pdfplumber; pdf=pdfplumber.open\\('pra_nlp_s26.pdf'\\); print\\('\\\\n'.join\\(\\(p.extract_text\\(\\) or ''\\) for p in pdf.pages\\)\\)\")",
+      "Bash(pip install *)",
+      "Bash(python -c \"import pypdf; r=pypdf.PdfReader\\('pra_nlp_s26.pdf'\\); open\\(r'C:\\\\Users\\\\kumar\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-kumar-Desktop-NLP-project\\\\a64b39a4-b931-4a4e-8dd8-22d7e9f905b8\\\\scratchpad\\\\pdf.txt','w',encoding='utf-8'\\).write\\('\\\\n'.join\\(p.extract_text\\(\\) for p in r.pages\\)\\); print\\('OK'\\)\")",
+      "Bash(python -m src.main --limit-papers 5 --output 'C:\\\\Users\\\\kumar\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-kumar-Desktop-NLP-project\\\\a64b39a4-b931-4a4e-8dd8-22d7e9f905b8\\\\scratchpad\\\\new_out.json')",
+      "Bash(python -c ' *)",
+      "Bash(python -m src.main)",
+      "WebSearch",
+      "Bash(python -c \"import src.nlp_methods, src.arxiv_html, src.pipeline, src.main; print\\('imports OK'\\)\")"
+    ]
+  }
+}

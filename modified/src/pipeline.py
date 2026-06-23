@@ -27,6 +27,7 @@ class ExtractionPipeline:
         sleep_seconds: float,
         embedding_model: str,
         max_relation_edges: int,
+        relation_threshold: float,
     ) -> None:
         self.paper_list = paper_list
         self.output_path = output_path
@@ -35,9 +36,11 @@ class ExtractionPipeline:
         self.client = ArxivHtmlClient(cache_dir, sleep_seconds)
         self.text = TextTools()
         self.similarity = EmbeddingSimilarity(embedding_model, model_cache_dir)
-        self.meanings = MeaningExtractor(self.text)
+        self.meanings = MeaningExtractor(self.text, self.similarity)
         self.symbols = SymbolExtractor(self.text)
-        self.relations = RelationExtractor(self.text, self.similarity, max_edges=max_relation_edges)
+        self.relations = RelationExtractor(
+            self.text, self.similarity, max_edges=max_relation_edges, threshold=relation_threshold
+        )
 
     def run(self) -> Dict[str, Dict]:
         """Run extraction and write the JSON output."""
@@ -67,6 +70,7 @@ class ExtractionPipeline:
 
         built: Dict[str, Dict] = {}
         audits: Dict[str, AuditTrail] = {}
+        used_meanings: set[str] = set()
         for block in tqdm(equation_blocks, desc=arxiv_id, unit="eq", leave=False):
             audit = AuditTrail()
             audit.extend(paper_audit, prefix="paper_")
@@ -74,7 +78,12 @@ class ExtractionPipeline:
             local_context = f"{block.before} {block.after}"
             local_sentences = self.text.sentences(local_context)
 
-            meaning = self.meanings.extract(block.number, block.before, block.after, audit, equation_symbols=block.mathml_symbols)
+            meaning = self.meanings.extract(
+                block.number, block.before, block.after, audit,
+                equation_symbols=block.mathml_symbols, used=used_meanings,
+            )
+            if meaning:
+                used_meanings.add(meaning)
             symbol_defs, raw_symbols = self.symbols.extract(
                 block.mathml_symbols,
                 local_sentences,

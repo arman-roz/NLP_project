@@ -15,13 +15,11 @@ The spaCy model is required because meaning extraction uses POS tags and noun ph
 
 The extraction method uses document structure and linguistic parses instead of physics or LaTeX vocabulary lists:
 
-- explicit equation references are the strongest signal
-- meaning sentences are scored with spaCy POS tags and noun phrases
-- symbol candidates come directly from MathML `<mi>` identifiers; `<mo>` operators and `<mn>` numbers are ignored by structure
-- single-character identifiers in MathML subscript positions are treated as indices
-- symbol definitions are extracted from dependency parses of sentences that mention the symbol
-- strong relation descriptions are verb phrases extracted from the citation sentence itself
-- potential relation descriptions are shared noun phrases from the two equation contexts
+- inline LaTeX in the surrounding prose is converted to readable Unicode with the `pylatexenc` library (so `I_{\rm OFF}` reads as `I_OFF`, not `I rm OFF`); the `equation` field keeps verbatim LaTeX
+- the `meaning` is a short *name* for the equation (e.g. "wave function", "threshold power"), extracted from the introducing sentence's subject/complement noun phrase — not a whole sentence
+- symbol candidates come directly from MathML `<mi>` identifiers; `<mo>` operators and `<mn>` numbers are ignored by structure, and standard math operators (∇, ∂, δ, d) are excluded as the spec allows
+- symbol definitions are extracted from generic definitional grammar ("where X is the …", "the … X") plus a spaCy dependency-parse fallback; a symbol name like `eta` is matched to the Unicode `η` via `unicodedata` (no hand-written symbol tables)
+- strong relation descriptions are verb phrases from the citation sentence; potential descriptions are shared noun phrases from the two equation contexts
 - potential edges are capped per equation to reduce overgeneration
 
 The default embedding model is `tbs17/MathBERT`. It is used only as an encoder for similarity/ranking, not for generation or prompting. Transformer files are cached under `modified/data/model_cache`.

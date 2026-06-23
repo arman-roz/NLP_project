@@ -34,6 +34,7 @@ def main() -> None:
         sleep_seconds=args.sleep_seconds,
         embedding_model=args.embedding_model,
         max_relation_edges=args.max_relation_edges,
+        relation_threshold=args.relation_threshold,
     )
     dataset = pipeline.run()
     total_equations = sum(len(equations) for equations in dataset.values())
@@ -48,6 +49,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-papers", type=int, default=2)
     parser.add_argument("--max-equations-per-paper", type=int, default=7)
     parser.add_argument("--max-relation-edges", type=int, default=2)
+    parser.add_argument(
+        "--relation-threshold",
+        type=float,
+        default=0.9,
+        help="Cosine-similarity threshold above which two equation contexts form "
+        "a 'potential' relation (calibrated for the MathBERT encoder).",
+    )
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--model-cache-dir", type=Path, default=DEFAULT_MODEL_CACHE_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)

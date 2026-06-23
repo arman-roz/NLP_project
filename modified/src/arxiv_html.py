@@ -6,6 +6,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 from html.entities import codepoint2name
 from pathlib import Path
 from typing import List, Optional
@@ -20,6 +21,31 @@ USER_AGENT = "OTH-NLP-EquationKG/0.2 (student project; respects arxiv robots.txt
 CRAWL_DELAY_SECONDS = 15.0
 
 _EQ_NUMBER_RE = re.compile(r"^\s*\(\s*([A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*)\s*\)\s*$")
+
+# pylatexenc renders inline LaTeX in the prose context to readable Unicode
+# (e.g. ``I_{\rm OFF}`` -> ``I_OFF``, ``\eta_{\text{D}}`` -> ``η_D``). This is
+# used only for the surrounding text the NLP methods read; the ``equation`` field
+# keeps the verbatim LaTeX. Done with a library rather than ad-hoc regex so the
+# full LaTeX macro set (``\rm``, ``\cal``, ``\hat``, Greek letters, ...) is
+# handled correctly instead of leaking command names like "rm" into the text.
+try:
+    from pylatexenc.latex2text import LatexNodes2Text
+
+    _LATEX2TEXT = LatexNodes2Text(math_mode="text", strict_latex_spaces="based-on-source")
+except Exception:  # pragma: no cover - pylatexenc is a hard dependency in practice
+    _LATEX2TEXT = None
+
+
+@lru_cache(maxsize=50000)
+def _latex_inline_to_text(latex: str) -> str:
+    """Convert a small inline LaTeX fragment to readable Unicode text."""
+
+    if _LATEX2TEXT is None or not latex:
+        return latex
+    try:
+        return _LATEX2TEXT.latex_to_text(latex).strip()
+    except Exception:
+        return latex
 
 
 @dataclass
@@ -93,7 +119,7 @@ class ArxivHtmlPaper:
         for table in soup.find_all("table", class_="ltx_eqn_table"):
             table.decompose()
         for math in soup.find_all("math"):
-            math.replace_with(" " + _math_text(math) + " ")
+            math.replace_with(" " + _latex_inline_to_text(_math_text(math)) + " ")
         return _clean_text(soup.get_text(" ", strip=True))
 
     def equations(self, max_equations: int, audit: AuditTrail) -> List[EquationBlock]:
@@ -240,7 +266,7 @@ def _text_keep_inline_math(node) -> str:
     for table in soup.find_all("table"):
         table.decompose()
     for math in soup.find_all("math"):
-        math.replace_with(" " + _math_text(math) + " ")
+        math.replace_with(" " + _latex_inline_to_text(_math_text(math)) + " ")
     for tag in soup.find_all("span"):
         classes = set(tag.get("class", []))
         if any(name.startswith("ltx_tag") for name in classes):
