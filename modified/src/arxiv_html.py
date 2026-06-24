@@ -116,9 +116,14 @@ class ArxivHtmlPaper:
         """Return article text with equation tables removed and inline math kept."""
 
         soup = BeautifulSoup(str(self.soup), "lxml")
+        _strip_error_spans(soup)
         for table in soup.find_all("table", class_="ltx_eqn_table"):
+            if table.parent is None:  # a nested table already detached by an outer one
+                continue
             table.decompose()
         for math in soup.find_all("math"):
+            if math.parent is None:  # a nested <math> already detached by an outer one
+                continue
             math.replace_with(" " + _latex_inline_to_text(_math_text(math)) + " ")
         return _clean_text(soup.get_text(" ", strip=True))
 
@@ -224,7 +229,7 @@ def _previous_math(rows: List[Tag], row: Tag) -> Optional[Tag]:
 
 
 def _main_paragraph(node: Tag) -> Optional[Tag]:
-    return node.find_parent(lambda item: item.name == "div" and "ltx_para" in item.get("class", [])) or node.find_parent("p")
+    return node.find_parent(lambda item: item.name == "div" and "ltx_para" in (item.get("class") or [])) or node.find_parent("p")
 
 
 def _text_inside(container: Tag, marker: Tag, before: bool) -> str:
@@ -250,11 +255,25 @@ def _nearby_paragraph(node: Tag, previous: bool) -> str:
             continue
         if candidate.find("table", class_="ltx_eqn_table"):
             continue
-        if candidate.name == "p" or "ltx_para" in candidate.get("class", []):
+        if candidate.name == "p" or "ltx_para" in (candidate.get("class") or []):
             text = _text_keep_inline_math(candidate)
             if len(text.split()) >= 6:
                 return text
     return ""
+
+
+def _strip_error_spans(soup: BeautifulSoup) -> None:
+    """Remove LaTeXML error nodes so undefined-macro leftovers never reach prose.
+
+    When LaTeXML cannot expand a macro it emits ``<span class="ltx_ERROR ...">``
+    holding the raw command (e.g. ``\\textcolor``). Dropping these spans by their
+    structural error class -- not by any word list -- keeps markup names like
+    "textcolor" out of the extracted meanings and symbol definitions.
+    """
+
+    for span in soup.find_all("span", class_="ltx_ERROR"):
+        if span.parent is not None:
+            span.decompose()
 
 
 def _text_keep_inline_math(node) -> str:
@@ -263,12 +282,21 @@ def _text_keep_inline_math(node) -> str:
     if not isinstance(node, Tag):
         return ""
     soup = BeautifulSoup(str(node), "lxml")
+    _strip_error_spans(soup)
     for table in soup.find_all("table"):
+        if table.parent is None:  # a nested table already detached by an outer one
+            continue
         table.decompose()
     for math in soup.find_all("math"):
+        if math.parent is None:  # a nested <math> already detached by an outer one
+            continue
         math.replace_with(" " + _latex_inline_to_text(_math_text(math)) + " ")
     for tag in soup.find_all("span"):
-        classes = set(tag.get("class", []))
+        # Decomposing a span removes its nested spans too; those stale nodes stay
+        # in this list with ``attrs is None``, so skip them to avoid AttributeError.
+        if tag.attrs is None:
+            continue
+        classes = set(tag.get("class", []) or [])
         if any(name.startswith("ltx_tag") for name in classes):
             tag.decompose()
     return _clean_text(soup.get_text(" ", strip=True))
@@ -368,7 +396,7 @@ def _is_text_identifier(mi: Tag, raw: str) -> bool:
     variant = str(mi.get("mathvariant", "")).lower()
     if variant in {"normal", "upright"}:
         return True
-    classes = " ".join(mi.get("class", [])).lower()
+    classes = " ".join(mi.get("class") or []).lower()
     if "text" in classes or "mathrm" in classes:
         return True
     return len(raw) > 1 and raw.isascii() and raw.isalpha()

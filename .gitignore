@@ -53,3 +53,6 @@ env/
 outputs/
 checkpoints/
 models/
+# Vinay: exclude the parallel new-project track and stray test artifact
+new project/
+modified/test_output.json

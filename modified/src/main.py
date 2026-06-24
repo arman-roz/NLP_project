@@ -1,5 +1,5 @@
 """Command line entry point for the equation knowledge graph prototype."""
-
+# run using python -m src.main --output data/output/run_final.json
 from __future__ import annotations
 
 import argparse
@@ -14,7 +14,6 @@ REPO_DIR = PROJECT_DIR.parent
 
 DEFAULT_PAPER_LIST = REPO_DIR / "paper_list_44.txt"
 DEFAULT_CACHE_DIR = PROJECT_DIR / "data" / "cache"
-DEFAULT_MODEL_CACHE_DIR = PROJECT_DIR / "data" / "model_cache"
 DEFAULT_OUTPUT = PROJECT_DIR / "data" / "output" / "sample_2_papers.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
@@ -27,14 +26,13 @@ def main() -> None:
     pipeline = ExtractionPipeline(
         paper_list=args.paper_list,
         cache_dir=args.cache_dir,
-        model_cache_dir=args.model_cache_dir,
         output_path=args.output,
         limit_papers=args.limit_papers,
         max_equations_per_paper=args.max_equations_per_paper,
         sleep_seconds=args.sleep_seconds,
-        embedding_model=args.embedding_model,
         max_relation_edges=args.max_relation_edges,
         relation_threshold=args.relation_threshold,
+        target_equations=args.target_equations,
     )
     dataset = pipeline.run()
     total_equations = sum(len(equations) for equations in dataset.values())
@@ -47,22 +45,28 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract equation KG JSON from arXiv HTML.")
     parser.add_argument("--paper-list", type=Path, default=DEFAULT_PAPER_LIST)
     parser.add_argument("--limit-papers", type=int, default=2)
+    parser.add_argument(
+        "--target-equations",
+        type=int,
+        default=350,
+        help="Process papers in order until the dataset reaches this many equations "
+        "(the paper that crosses the target is still processed in full, per spec). "
+        "Set to 0 to use --limit-papers instead.",
+    )
     parser.add_argument("--max-equations-per-paper", type=int, default=7)
     parser.add_argument("--max-relation-edges", type=int, default=2)
     parser.add_argument(
         "--relation-threshold",
         type=float,
-        default=0.62,
-        help="Combined topical-score floor (MathBERT context cosine + shared "
-        "symbols + shared-noun Jaccard) below which a pair can never be a "
-        "'potential' relation; the top --max-relation-edges partners above it "
-        "are kept per equation.",
+        default=0.12,
+        help="Lexical topical-score floor (shared context nouns Jaccard + 0.15 "
+        "per shared symbol) below which a pair can never be a 'potential' "
+        "relation; the top --max-relation-edges partners above it are kept per "
+        "equation.",
     )
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
-    parser.add_argument("--model-cache-dir", type=Path, default=DEFAULT_MODEL_CACHE_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--sleep-seconds", type=float, default=CRAWL_DELAY_SECONDS)
-    parser.add_argument("--embedding-model", default="tbs17/MathBERT")
     return parser.parse_args()
 
 
