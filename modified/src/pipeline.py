@@ -81,6 +81,7 @@ class ExtractionPipeline:
             meaning = self.meanings.extract(
                 block.number, block.before, block.after, audit,
                 equation_symbols=block.mathml_symbols, used=used_meanings,
+                paper_sentences=paper_sentences,
             )
             if meaning:
                 used_meanings.add(meaning)

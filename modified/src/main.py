@@ -52,9 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--relation-threshold",
         type=float,
-        default=0.9,
-        help="Cosine-similarity threshold above which two equation contexts form "
-        "a 'potential' relation (calibrated for the MathBERT encoder).",
+        default=0.62,
+        help="Combined topical-score floor (MathBERT context cosine + shared "
+        "symbols + shared-noun Jaccard) below which a pair can never be a "
+        "'potential' relation; the top --max-relation-edges partners above it "
+        "are kept per equation.",
     )
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--model-cache-dir", type=Path, default=DEFAULT_MODEL_CACHE_DIR)

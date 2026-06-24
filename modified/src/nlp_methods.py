@@ -1,4 +1,12 @@
-"""NLP methods for meanings, symbols, and equation relations."""
+"""NLP methods for equation meanings, symbol definitions, and relations.
+
+All textual output is *extracted* from the arXiv paper -- never generated. The
+transformer (MathBERT) is used only as an encoder for cosine similarity. Symbol
+candidates come from the equation's MathML structure; meanings and symbol
+definitions are noun phrases lifted from the surrounding prose using the spaCy
+parse, POS tags and ``unicodedata`` rather than any hand-written physics
+vocabulary, so the method generalises to unseen quantum-physics terminology.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +24,8 @@ from .common import AuditTrail, short
 
 @lru_cache(maxsize=1)
 def _load_spacy():
+    """Load the small English spaCy model (POS tagger + dependency parser)."""
+
     if not spacy.util.is_package("en_core_web_sm"):
         raise RuntimeError(
             "spaCy model en_core_web_sm is required. "
@@ -24,165 +34,31 @@ def _load_spacy():
     return spacy.load("en_core_web_sm")
 
 
-class TextTools:
-    """Sentence, token, POS, dependency, and lemma helpers."""
-
-    def __init__(self) -> None:
-        self.nlp = _load_spacy()
-        self.sent_nlp = spacy.blank("en")
-        self.sent_nlp.add_pipe("sentencizer")
-        self.has_parser = "parser" in self.nlp.pipe_names
-        self.stop_words = set(self.nlp.Defaults.stop_words)
-
-    def sentences(self, text: str) -> List[str]:
-        """Return clean sentence strings."""
-
-        cleaned = self.clean(text)
-        if not cleaned:
-            return []
-        doc = self.sent_nlp(cleaned)
-        return [sent.text.strip() for sent in doc.sents if self._good_sentence(sent.text)]
-
-    def tokens(self, text: str, keep: Iterable[str] = ()) -> List[str]:
-        """Return normalized non-stopword lemmas."""
-
-        keep_set = {item.lower() for item in keep}
-        doc = self.nlp(self.clean(text))
-        out: List[str] = []
-        for token in doc:
-            raw = token.text.lower()
-            lemma = token.lemma_.lower() if token.lemma_ else raw
-            if token.is_space or token.is_punct or token.like_num:
-                continue
-            if raw in self.stop_words and raw not in keep_set:
-                continue
-            if len(lemma) >= 2 and re.search(r"[a-z]", lemma):
-                out.append(lemma)
-        return out
-
-    def doc(self, text: str):
-        """Return a spaCy document."""
-
-        return self.nlp(self.clean(text))
-
-    def raw_doc(self, text: str):
-        """Return a spaCy document without TeX-oriented cleanup."""
-
-        return self.nlp(text.replace("\xa0", " "))
-
-    @staticmethod
-    def clean(text: str) -> str:
-        """Normalize paper text while preserving LaTeX command names as words."""
-
-        text = text.replace("\xa0", " ")
-        text = re.sub(r"\\([A-Za-z]+)", r" \1 ", text)
-        text = re.sub(r"[{}_^$]", " ", text)
-        return re.sub(r"\s+", " ", text).strip()
-
-    @staticmethod
-    def _good_sentence(sentence: str) -> bool:
-        words = re.findall(r"[A-Za-z]{2,}", sentence)
-        return len(words) >= 4 and 20 <= len(sentence) <= 500
-
-
-class EmbeddingSimilarity:
-    """Transformer encoder wrapper used only for similarity, never generation.
-    Uses AutoModel with mean pooling for proper sentence embeddings.
-    """
-
-    def __init__(self, model_name: str, cache_dir: Path) -> None:
-        self.model_name = model_name
-        self.cache_dir = cache_dir
-        self._model = None
-        self._tokenizer = None
-
-    def encode(self, texts: List[str]) -> np.ndarray:
-        """Encode texts into normalized vectors using mean pooling."""
-        if not texts:
-            return np.zeros((0, 1), dtype=float)
-        model, tokenizer = self._load()
-        import torch
-        model.eval()
-        with torch.no_grad():
-            inputs = tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
-            outputs = model(**inputs)
-            # Mean pooling
-            attention_mask = inputs["attention_mask"]
-            token_embeddings = outputs.last_hidden_state
-            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-            embeddings = sum_embeddings / sum_mask
-            # Normalize
-            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-        return embeddings.cpu().numpy()
-
-    def pairwise(self, labels: List[str], texts: List[str]) -> Dict[Tuple[str, str], float]:
-        if len(labels) < 2:
-            return {}
-        if len(labels) != len(texts):
-            raise ValueError("labels and texts must have the same length")
-        vectors = self.encode(texts)
-        out: Dict[Tuple[str, str], float] = {}
-        for i, left in enumerate(labels):
-            for j, right in enumerate(labels):
-                if left != right:
-                    out[(left, right)] = float(np.dot(vectors[i], vectors[j]))
-        return out
-
-    def rank(self, query: str, candidates: List[str]) -> List[float]:
-        if not candidates:
-            return []
-        vectors = self.encode([query] + candidates)
-        query_vec = vectors[0]
-        return [float(np.dot(query_vec, vec)) for vec in vectors[1:]]
-
-    def _load(self):
-        if self._model is None:
-            from transformers import AutoModel, AutoTokenizer
-
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name, cache_dir=str(self.cache_dir))
-            self._model = AutoModel.from_pretrained(self.model_name, cache_dir=str(self.cache_dir))
-            self._model.eval()
-        return self._model, self._tokenizer
-
-
 # ---------------------------------------------------------------------------
-# Grammar-driven noun-phrase helpers (shared by meaning and symbol extraction)
-#
-# These replace hand-written word lists with the spaCy parse + Unicode data, so
-# they generalize to papers whose vocabulary we have never seen. A "name" or a
-# symbol "definition" is a noun phrase: its head noun, the modifiers in front of
-# it, and any "of"/"for" complement after it ("degree of coherence", not just
-# "degree"). Determiners, prepositions and conjunctions are identified by their
-# part-of-speech tag, not by being on a list of specific English words.
+# Domain-independent constants. The only word lists kept are *markup* (LaTeX
+# command names) and structural "meta" nouns -- never physics vocabulary -- so
+# the extractors do not over-fit to terms seen in these particular papers.
 # ---------------------------------------------------------------------------
 
-# Dependency labels of children that begin a *new clause* and so must not be
-# pulled into a noun phrase (relative/adverbial/complement clauses, etc.).
+# Dependency labels of children that begin a *new clause* (relative/adverbial/
+# complement clauses) and so must not be pulled into a noun phrase.
 _CLAUSE_DEPS = {"relcl", "acl", "advcl", "ccomp", "xcomp", "csubj", "parataxis"}
 # Prepositions that introduce a genuine post-nominal complement worth keeping
-# ("degree of coherence", "density of states"). Others (by/from/with/...) tend
-# to start a separate adjunct, so they are dropped to keep the name compact.
+# ("degree of coherence", "density of states"). Others tend to start an adjunct.
 _KEEP_PREPS = {"of", "for"}
-# Edge part-of-speech tags to trim off the start/end of a phrase (articles,
-# prepositions, conjunctions, particles, auxiliaries, pronouns, punctuation).
+# Edge POS tags trimmed off the start/end of a phrase (articles, prepositions,
+# conjunctions, particles, auxiliaries, pronouns, punctuation).
 _EDGE_POS = {"DET", "ADP", "CCONJ", "SCONJ", "PART", "PUNCT", "AUX", "PRON"}
-# Structural "meta" nouns that name a piece of writing rather than a physics
-# concept. Domain-independent (they occur in any paper, not in the unseen physics
-# vocabulary), so rejecting one as a *lone* name/definition does not hurt
-# generalization; specific multi-word phrases never trigger this guard. This is
-# the only content-word list the extractors keep -- everything else is decided
-# from POS tags, the dependency parse, and the embedding ranker.
+# Structural nouns that name a piece of writing rather than a physics concept.
+# Rejecting one as a *lone* name/definition is domain-independent and safe.
 _META_NOUNS = {
     "equation", "result", "form", "case", "value", "term", "expression",
     "quantity", "parameter", "function", "system", "example", "section",
     "figure", "table", "paper", "method", "approach", "number", "order",
     "part", "side", "way", "set", "thing", "one",
 }
-# LaTeX/MathML command leftovers (a fixed, finite set of markup tokens -- not
-# domain vocabulary). Greek letter names are handled separately via unicodedata.
+# LaTeX/MathML command leftovers (markup, not domain vocabulary). Greek letter
+# names are handled separately via ``unicodedata``.
 _LATEX_CMDS = {
     "rm", "mathrm", "text", "textrm", "cal", "mathcal", "mathbb", "mathbbm",
     "mathfrak", "hat", "bar", "tilde", "vec", "dot", "operatorname", "langle",
@@ -196,7 +72,7 @@ _LATEX_CMDS = {
 def _is_greek_letter_name(word: str) -> bool:
     """True if ``word`` is the spelled-out name of a Greek letter (eta, phi, ...).
 
-    Uses ``unicodedata`` to ask whether a Greek code point with this name exists,
+    Uses ``unicodedata`` to ask whether a Greek code point with this name exists
     instead of hard-coding the alphabet, so it covers every Greek letter name.
     """
 
@@ -208,6 +84,24 @@ def _is_greek_letter_name(word: str) -> bool:
         except KeyError:
             continue
     return False
+
+
+@lru_cache(maxsize=4096)
+def _surface_variants(base: str) -> frozenset:
+    """Surface forms of a symbol: its name plus Unicode Greek equivalents.
+
+    Uses ``unicodedata`` (a library, not a hand-written table) so a MathML name
+    like ``eta`` also matches the Unicode ``η``/``Η`` written in the prose.
+    """
+
+    variants = {base}
+    upper = base.upper()
+    for template in ("GREEK SMALL LETTER {}", "GREEK CAPITAL LETTER {}", "GREEK {} SYMBOL"):
+        try:
+            variants.add(unicodedata.lookup(template.format(upper)))
+        except KeyError:
+            pass
+    return frozenset(v for v in variants if v)
 
 
 def _content_token(token) -> bool:
@@ -225,8 +119,8 @@ def _content_token(token) -> bool:
 def _np_span(head):
     """Token span of the noun phrase headed by ``head``.
 
-    Walks the head noun's dependency subtree, keeping determiners, adjectival,
-    compound, numeric and possessive modifiers plus "of"/"for" complements, but
+    Walks the head noun's subtree, keeping determiners, adjectival, compound,
+    numeric and possessive modifiers plus ``of``/``for`` complements, but
     stopping at clause boundaries, appositions and coordinations. This yields
     full names like "degree of coherence" that spaCy's base noun chunks would
     truncate to "degree".
@@ -265,15 +159,168 @@ def _phrase_tokens(tokens, stop_words) -> List:
     return kept
 
 
+def _phrase_from_text(text: str, tools: "TextTools") -> str:
+    """Reduce a raw captured string to a compact, math-free phrase (<=8 words).
+
+    Strips LaTeX/markup and bracketed material, re-parses the remainder, then
+    keeps content words with POS-based edge trimming. Shared by the meaning and
+    symbol extractors so the same cleaning rule applies everywhere.
+    """
+
+    text = text.replace("�", " ")
+    text = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", text)
+    text = re.sub(r"\\[A-Za-z]+", " ", text)
+    text = re.sub(r"[{}_^$\\]", " ", text)
+    tokens = _phrase_tokens(list(tools.doc(text)), tools.stop_words)
+    return " ".join(token.text for token in tokens[:8])
+
+
+class TextTools:
+    """Sentence, token, POS, dependency, and lemma helpers."""
+
+    def __init__(self) -> None:
+        self.nlp = _load_spacy()
+        # A blank pipeline with a sentencizer that also breaks on ":" and ";"
+        # so an introducing clause like "... is given by:" is isolated from the
+        # following sentence (important for picking the right meaning).
+        self.sent_nlp = spacy.blank("en")
+        self.sent_nlp.add_pipe(
+            "sentencizer", config={"punct_chars": [".", "!", "?", ";", ":", "…"]}
+        )
+        self.stop_words = set(self.nlp.Defaults.stop_words)
+
+    def sentences(self, text: str) -> List[str]:
+        """Return clean, sufficiently long sentence strings."""
+
+        cleaned = self.clean(text)
+        if not cleaned:
+            return []
+        doc = self.sent_nlp(cleaned)
+        return [s.text.strip() for s in doc.sents if self._good_sentence(s.text)]
+
+    def tokens(self, text: str, keep: Iterable[str] = ()) -> List[str]:
+        """Return normalised non-stopword lemmas (a simple bag of words)."""
+
+        keep_set = {item.lower() for item in keep}
+        out: List[str] = []
+        for token in self.nlp(self.clean(text)):
+            raw = token.text.lower()
+            lemma = token.lemma_.lower() if token.lemma_ else raw
+            if token.is_space or token.is_punct or token.like_num:
+                continue
+            if raw in self.stop_words and raw not in keep_set:
+                continue
+            if len(lemma) >= 2 and re.search(r"[a-z]", lemma):
+                out.append(lemma)
+        return out
+
+    def doc(self, text: str):
+        """Return a spaCy document over TeX-cleaned text."""
+
+        return self.nlp(self.clean(text))
+
+    def raw_doc(self, text: str):
+        """Return a spaCy document without TeX cleanup (keeps char offsets)."""
+
+        return self.nlp(text.replace("\xa0", " "))
+
+    @staticmethod
+    def clean(text: str) -> str:
+        """Normalise paper text while preserving LaTeX command names as words."""
+
+        text = text.replace("\xa0", " ")
+        text = re.sub(r"\\([A-Za-z]+)", r" \1 ", text)
+        text = re.sub(r"[{}_^$]", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _good_sentence(sentence: str) -> bool:
+        words = re.findall(r"[A-Za-z]{2,}", sentence)
+        return len(words) >= 4 and 20 <= len(sentence) <= 500
+
+
+class EmbeddingSimilarity:
+    """Transformer encoder used only for similarity, never for generation.
+
+    Uses ``AutoModel`` with mean pooling and L2 normalisation to produce
+    sentence embeddings, then compares them by cosine (dot product).
+    """
+
+    def __init__(self, model_name: str, cache_dir: Path) -> None:
+        self.model_name = model_name
+        self.cache_dir = cache_dir
+        self._model = None
+        self._tokenizer = None
+
+    def encode(self, texts: List[str]) -> np.ndarray:
+        """Encode texts into L2-normalised mean-pooled vectors."""
+
+        if not texts:
+            return np.zeros((0, 1), dtype=float)
+        model, tokenizer = self._load()
+        import torch
+
+        model.eval()
+        with torch.no_grad():
+            inputs = tokenizer(
+                texts, padding=True, truncation=True, max_length=512, return_tensors="pt"
+            )
+            outputs = model(**inputs)
+            mask = inputs["attention_mask"].unsqueeze(-1).float()
+            token_embeddings = outputs.last_hidden_state
+            summed = torch.sum(token_embeddings * mask, 1)
+            counts = torch.clamp(mask.sum(1), min=1e-9)
+            embeddings = torch.nn.functional.normalize(summed / counts, p=2, dim=1)
+        return embeddings.cpu().numpy()
+
+    def pairwise(self, labels: List[str], texts: List[str]) -> Dict[Tuple[str, str], float]:
+        """Cosine similarity for every ordered pair of labelled texts."""
+
+        if len(labels) < 2:
+            return {}
+        if len(labels) != len(texts):
+            raise ValueError("labels and texts must have the same length")
+        vectors = self.encode(texts)
+        out: Dict[Tuple[str, str], float] = {}
+        for i, left in enumerate(labels):
+            for j, right in enumerate(labels):
+                if left != right:
+                    out[(left, right)] = float(np.dot(vectors[i], vectors[j]))
+        return out
+
+    def rank(self, query: str, candidates: List[str]) -> List[float]:
+        """Cosine similarity of each candidate to the query."""
+
+        if not candidates:
+            return []
+        vectors = self.encode([query] + candidates)
+        query_vec = vectors[0]
+        return [float(np.dot(query_vec, vec)) for vec in vectors[1:]]
+
+    def _load(self):
+        if self._model is None:
+            from transformers import AutoModel, AutoTokenizer
+
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, cache_dir=str(self.cache_dir)
+            )
+            self._model = AutoModel.from_pretrained(
+                self.model_name, cache_dir=str(self.cache_dir)
+            )
+            self._model.eval()
+        return self._model, self._tokenizer
+
+
 class MeaningExtractor:
     """Extracts a short, precise *name* for each equation.
 
-    The ``meaning`` field is meant to be a concise description of what the
-    equation expresses or its name (e.g. "wave function", "threshold power",
-    "Newton's third law") -- not a whole explanatory sentence. The name is
-    always extracted verbatim from the paper text (never generated): it is the
-    noun phrase the equation is introduced with, an explicit "called/known as"
-    label, or a named-equation phrase ("X equation/law/theorem").
+    The ``meaning`` field is a concise description / name of what the equation
+    expresses (e.g. "wave function", "threshold power"), not a whole sentence.
+    The name is always lifted verbatim from the paper: an explicit "called/known
+    as X" or "X equation/law" label, or the noun phrase the introducing clause
+    describes. An acronym (e.g. "CMI") is expanded to the long form the paper
+    itself spells out ("conditional mutual information (CMI)").
     """
 
     _CALLED_RE = re.compile(
@@ -301,51 +348,55 @@ class MeaningExtractor:
         audit: AuditTrail,
         equation_symbols: Optional[List[str]] = None,
         used: Optional[set] = None,
+        paper_sentences: Optional[List[str]] = None,
     ) -> str:
         """Return a short name/description for the equation.
-
-        The name is produced extractively in three tiers. First an explicit
-        "called/known as X" or "X equation/law" label is trusted outright.
-        Otherwise candidate noun phrases are collected from each clause near the
-        equation -- *both* the subject and the object, without any verb list --
-        and the embedding encoder ranks them by cosine similarity to the
-        equation's local context, so the phrase most central to what the equation
-        is about wins. No text is generated; the encoder only *ranks* phrases
-        lifted verbatim from the paper.
 
         Parameters
         ----------
         eq_num : str
-            The equation number (used to find sentences citing this equation).
+            Equation number (used to find sentences citing this equation).
         before, after : str
             Prose context immediately before/after the equation.
         audit : AuditTrail
-            Trail to record which strategy and sentence produced the name.
-        equation_symbols : list[str], optional
-            Unused for naming; kept for interface compatibility.
-        used : set[str], optional
-            Names already assigned to earlier equations in the same paper. The
-            ranker prefers a different name so equations do not all collapse onto
-            one repeated meaning (it still reuses a name if no alternative fits).
+            Trail recording which strategy and sentence produced the name.
+        equation_symbols : list of str, optional
+            The equation's symbols; sentences that mention a *distinctive* one
+            (a named/Greek symbol) are prioritised as the introducing clause.
+        used : set of str, optional
+            Names already taken by earlier equations; a different name is
+            preferred so a paper's meanings do not all collapse onto one.
+        paper_sentences : list of str, optional
+            Whole-paper sentences, used only to expand an acronym to its long
+            form when the paper defines one.
 
         Returns
         -------
         str
-            A concise extracted name (e.g. "degree of coherence"), or "" if no
-            usable name is found in the local context.
+            A concise extracted name, or ``""`` if none is found nearby.
         """
 
-        candidates = self._ordered_candidates(eq_num, before, after)
+        candidates = self._ordered_candidates(eq_num, before, after, equation_symbols)
         if not candidates:
             audit.add("meaning", "no local prose sentence")
             return ""
         local_context = f"{before} {after}".strip()
         used = used or set()
 
-        # Tier 1: explicit naming -- "called/known as X" or "X equation/law".
-        # Named-equation matches are only trusted in an introducing context
-        # (the sentence cites the equation or directly precedes it) to avoid
-        # picking up an unrelated named theorem mentioned in passing.
+        name = self._select_name(eq_num, candidates, local_context, used, audit)
+        if not name:
+            audit.add("meaning", f"no name found in {len(candidates)} sentences")
+            return ""
+        expanded = self._expand_acronym(name, paper_sentences)
+        if expanded != name:
+            audit.add("meaning", f"expanded acronym {name} -> {expanded}")
+        return expanded
+
+    def _select_name(self, eq_num, candidates, local_context, used, audit) -> str:
+        """Run the three naming tiers and return the chosen name (or "")."""
+
+        # Tier 1: an explicit "called/known as X" or "X equation/law" label
+        # (the latter only when the sentence is introducing this equation).
         for sentence, _ in candidates:
             phrase = self._name_from_called(sentence)
             if not phrase and self._is_intro_context(eq_num, sentence):
@@ -355,15 +406,13 @@ class MeaningExtractor:
                 return phrase
 
         # Tier 2: the noun phrase of the clause nearest the equation (subject vs.
-        # object chosen from the parse). Sentences are already ordered nearest
-        # first, so this is proximity-driven and deterministic -- the reliable
-        # signal for a name. Soft de-duplication prefers a name not yet used by an
-        # earlier equation but reuses one if the clause offers no alternative.
+        # object chosen from the parse). Proximity-first and deterministic; soft
+        # de-duplication prefers a name an earlier equation has not taken.
         clause_pairs = [
             (self._name_from_clause(sentence, prefer_last), sentence)
             for sentence, prefer_last in candidates
         ]
-        clause_pairs = [(phrase, sentence) for phrase, sentence in clause_pairs if phrase]
+        clause_pairs = [(p, s) for p, s in clause_pairs if p]
         for phrase, sentence in clause_pairs:
             if phrase not in used:
                 audit.add("meaning", f"clause: {phrase} <= {short(sentence)}")
@@ -372,26 +421,54 @@ class MeaningExtractor:
             audit.add("meaning", f"clause(reused): {clause_pairs[0][0]} <= {short(clause_pairs[0][1])}")
             return clause_pairs[0][0]
 
-        # Tier 3: no introducing clause -- fall back to nearby noun phrases, here
-        # ranked by embedding similarity to the local context (the ambiguous case
-        # where the encoder genuinely helps choose the most relevant phrase).
+        # Tier 3: no introducing clause -- rank nearby noun phrases by embedding
+        # similarity to the local context (the genuinely ambiguous case).
         best = self._rank_best(self._fallback_candidates(candidates), local_context, used)
         if best:
             audit.add("meaning", f"fallback: {best[0]} <= {short(best[1])}")
             return best[0]
-
-        audit.add("meaning", f"no name found in {len(candidates)} sentences")
         return ""
 
-    def _rank_best(self, pairs: List[tuple], context: str, used: set) -> Optional[tuple]:
-        """Pick the (phrase, sentence) whose phrase best fits the local context.
+    def _expand_acronym(self, name: str, paper_sentences: Optional[List[str]]) -> str:
+        """Expand a short acronym name to the long form the paper defines.
 
-        Candidates are de-duplicated keeping their first (nearest) occurrence and
-        ranked by cosine similarity to the context (nearest clause breaks near
-        ties, cosine rounded to 2dp). A name already used by an earlier equation
-        is only chosen if no unused candidate is available, which keeps a paper's
-        meanings varied without inventing anything.
+        Looks for "<long form> (ACRONYM)" anywhere in the paper and, if the long
+        form parses to a valid multi-word noun phrase, returns it. Keeps the
+        output "from arXiv only" -- the expansion is the paper's own wording.
         """
+
+        if not (name.isupper() and re.fullmatch(r"[A-Z]{2,6}", name)):
+            return name
+        # Capture the words just before "(ACRONYM)" and keep the run whose
+        # initials spell the acronym ("conditional mutual information" for CMI),
+        # which strips introducing verbs/articles the surrounding clause adds.
+        pattern = re.compile(r"((?:[A-Za-z][\w'\-]*\s+){1,9})\(\s*" + re.escape(name) + r"\s*\)")
+        for sentence in paper_sentences or []:
+            for match in pattern.finditer(sentence):
+                phrase = self._long_form_by_initials(match.group(1).split(), name.lower())
+                if phrase and self._valid_phrase(phrase):
+                    return phrase
+        return name
+
+    @staticmethod
+    def _long_form_by_initials(words: List[str], letters: str) -> str:
+        """Return the contiguous content-word run whose initials spell ``letters``.
+
+        Articles/prepositions are skipped (acronyms omit them); the run nearest
+        the acronym is preferred. Returns "" if no run matches.
+        """
+
+        skip = {"a", "an", "the", "of", "for", "and", "in", "on", "to", "with"}
+        kept = [w for w in words if w[:1].isalpha() and w.lower() not in skip]
+        initials = [w[0].lower() for w in kept]
+        match = ""
+        for start in range(len(kept) - len(letters) + 1):
+            if "".join(initials[start:start + len(letters)]) == letters:
+                match = " ".join(kept[start:start + len(letters)])  # keep rightmost
+        return match
+
+    def _rank_best(self, pairs: List[tuple], context: str, used: set) -> Optional[tuple]:
+        """Pick the (phrase, sentence) whose phrase best fits the local context."""
 
         unique: List[tuple] = []
         seen: set[str] = set()
@@ -403,32 +480,31 @@ class MeaningExtractor:
             return None
         if len(unique) == 1 and unique[0][0] not in used:
             return unique[0]
-
         if len(unique) == 1 or not context:
             scores = [1.0] * len(unique)
         else:
             scores = self.similarity.rank(context, [phrase for phrase, _ in unique])
-        order = sorted(
-            range(len(unique)), key=lambda i: (round(scores[i], 2), -i), reverse=True
-        )
+        order = sorted(range(len(unique)), key=lambda i: (round(scores[i], 2), -i), reverse=True)
         for index in order:
             if unique[index][0] not in used:
                 return unique[index]
         return unique[order[0]]
 
-    def _ordered_candidates(self, eq_num: str, before: str, after: str) -> List[tuple]:
+    def _ordered_candidates(
+        self, eq_num: str, before: str, after: str, symbols: Optional[List[str]]
+    ) -> List[tuple]:
         """Order context sentences by how likely they name the equation.
 
-        Returns ``(sentence, prefer_last)`` pairs. The sentence immediately
-        before the equation is usually the introducing sentence ("... is given
-        by:"), so it comes first, followed by the sentence immediately after,
-        then any sentence citing the equation number, then the remaining
-        context. ``prefer_last`` is True for ``before`` sentences (the equation
-        follows their last clause) and False for ``after`` sentences.
+        Returns ``(sentence, prefer_last)`` pairs: the sentence immediately
+        before the equation first (usually "... is given by:"), then the one
+        after, then sentences citing the equation number or mentioning one of
+        its distinctive symbols, then the rest. ``prefer_last`` is True for
+        ``before`` sentences (the equation follows their last clause).
         """
 
         before_sents = self.text.sentences(before)
         after_sents = self.text.sentences(after)
+        surfaces = self._distinctive_surfaces(symbols)
 
         ordered: List[tuple] = []
         if before_sents:
@@ -437,6 +513,8 @@ class MeaningExtractor:
             ordered.append((after_sents[0], False))
         ordered.extend((s, True) for s in before_sents if self._cites(eq_num, s))
         ordered.extend((s, False) for s in after_sents if self._cites(eq_num, s))
+        ordered.extend((s, True) for s in before_sents if self._mentions(s, surfaces))
+        ordered.extend((s, False) for s in after_sents if self._mentions(s, surfaces))
         ordered.extend((s, True) for s in reversed(before_sents[:-1]))
         ordered.extend((s, False) for s in after_sents[1:])
 
@@ -449,8 +527,24 @@ class MeaningExtractor:
         return out
 
     @staticmethod
+    def _distinctive_surfaces(symbols: Optional[List[str]]) -> set:
+        """Lower-cased surface forms of named/Greek symbols (single letters skipped)."""
+
+        surfaces: set = set()
+        for symbol in symbols or []:
+            base = symbol.split("_")[0]
+            if len(base) > 1 or _is_greek_letter_name(base.lower()):
+                surfaces.update(v.lower() for v in _surface_variants(base))
+        return surfaces
+
+    @staticmethod
+    def _mentions(sentence: str, surfaces: set) -> bool:
+        low = sentence.lower()
+        return any(surface in low for surface in surfaces)
+
+    @staticmethod
     def _cites(eq_num: str, sentence: str) -> bool:
-        """Return True if the sentence explicitly cites this equation number."""
+        """True if the sentence explicitly cites this equation number."""
 
         return bool(
             re.search(
@@ -471,7 +565,7 @@ class MeaningExtractor:
         match = self._CALLED_RE.search(self.text.clean(sentence))
         if not match:
             return ""
-        phrase = self._clean_phrase(match.group(1))
+        phrase = _phrase_from_text(match.group(1), self.text)
         return phrase if self._valid_phrase(phrase) else ""
 
     def _named_equation(self, sentence: str) -> str:
@@ -480,36 +574,28 @@ class MeaningExtractor:
         match = self._NAMED_EQ_RE.search(self.text.clean(sentence))
         if not match:
             return ""
-        phrase = self._clean_phrase(match.group(1))
-        # Keep multi-word names; a lone keyword ("equation") is not a name.
-        words = phrase.split()
-        return phrase if len(words) >= 2 and self._valid_phrase(phrase) else ""
+        phrase = _phrase_from_text(match.group(1), self.text)
+        return phrase if len(phrase.split()) >= 2 and self._valid_phrase(phrase) else ""
 
     def _name_from_clause(self, sentence: str, prefer_last: bool = True) -> str:
         """The noun phrase the equation's nearest clause describes.
 
         Which of the subject/object is the named quantity is decided from the
-        *parse*, not a verb list: in a passive ("X is given by:") or copula
-        ("X is ...") clause the subject is the quantity; in an active clause with
-        a pronoun subject ("we define X") the object is. Otherwise the subject is
-        tried first, then the object. Verbs are visited nearest-the-equation
-        first (``prefer_last`` for ``before`` text). Returns one phrase, or "".
+        *parse*, not a verb list: a passive ("X is given by:") or copula
+        ("X is ...") clause -> the subject; an active clause with a pronoun
+        subject ("we define X") -> the object. Verbs are visited nearest the
+        equation first. Returns one phrase, or "".
         """
 
         doc = self._parse_doc(sentence)
-        verbs = [
-            token for token in doc
-            if token.pos_ in {"VERB", "AUX"} and self._subject(token) is not None
-        ]
+        verbs = [t for t in doc if t.pos_ in {"VERB", "AUX"} and self._subject(t) is not None]
         verbs.sort(key=lambda token: token.i, reverse=prefer_last)
 
         for verb in verbs:
             subject = self._subject(verb)
             complement = self._complement(verb)
-            passive = any(child.dep_ in {"nsubjpass", "auxpass"} for child in verb.children)
-            copula = verb.lemma_ == "be" or any(
-                child.dep_ in {"attr", "acomp"} for child in verb.children
-            )
+            passive = any(c.dep_ in {"nsubjpass", "auxpass"} for c in verb.children)
+            copula = verb.lemma_ == "be" or any(c.dep_ in {"attr", "acomp"} for c in verb.children)
             pronoun_subject = subject is not None and subject.pos_ == "PRON"
             order = (
                 [complement, subject]
@@ -525,12 +611,7 @@ class MeaningExtractor:
         return ""
 
     def _phrase_from_head(self, head) -> str:
-        """Build the full noun-phrase name (with 'of'/'for' complements) of a head.
-
-        Unlike a base noun chunk, this keeps the prepositional complement so a
-        head like "degree" becomes "degree of coherence". Returns "" if the head
-        is not a noun or the phrase has no real content word.
-        """
+        """Full noun-phrase name (with 'of'/'for' complements) of a head noun."""
 
         if head is None or head.pos_ not in {"NOUN", "PROPN"}:
             return ""
@@ -542,7 +623,8 @@ class MeaningExtractor:
 
         pairs: List[tuple] = []
         for sentence, _ in candidates[:4]:
-            for chunk in self._noun_chunks(self._parse_doc(sentence)):
+            doc = self._parse_doc(sentence)
+            for chunk in self._noun_chunks(doc):
                 if self._is_reference(chunk.root):
                     continue
                 phrase = self._phrase_from_head(chunk.root)
@@ -551,13 +633,7 @@ class MeaningExtractor:
         return pairs
 
     def _parse_doc(self, sentence: str):
-        """Parse a sentence with inline math stripped so the prose parses cleanly.
-
-        Inline math identifiers (``I OFF`` from ``I_{\\rm OFF}``, single symbols,
-        Greek letters) confuse the dependency parser and break subject detection,
-        so they are removed before parsing. Only used for naming the equation;
-        symbol extraction keeps the original tokens.
-        """
+        """Parse a sentence with inline math stripped so the prose parses cleanly."""
 
         cleaned = re.sub(r"\([^)]*\)", " ", sentence)
         cleaned = re.sub(r"\[[^\]]*\]", " ", cleaned)
@@ -594,53 +670,23 @@ class MeaningExtractor:
 
     @staticmethod
     def _is_reference(token) -> bool:
-        """True if a noun-phrase head is a pronoun/citation rather than a name.
+        """True if a head is a pronoun/citation rather than a name (from the parse)."""
 
-        Decided from the parse, not a word list: pronouns/demonstratives
-        ("it", "this") are tagged ``PRON``, and an equation citation
-        ("Equation (2)") has the head lemma "eq"/"equation".
-        """
-
-        if token is None:
-            return True
-        if token.pos_ == "PRON":
+        if token is None or token.pos_ == "PRON":
             return True
         return token.lemma_.lower() in {"eq", "equation"}
 
-    def _clean_phrase(self, text: str) -> str:
-        """Reduce a regex-captured string to a compact, math-free name (<=8 words).
-
-        Used by the 'called X' / 'X equation' strategies, which yield a raw string
-        rather than a parse node. The string is re-parsed so the same POS-based
-        trimming and content-word filtering as the grammar path apply.
-        """
-
-        text = text.replace("�", " ")
-        text = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", text)
-        text = re.sub(r"\\[A-Za-z]+", " ", text)
-        text = re.sub(r"[{}_^$\\]", " ", text)
-        doc = self.text.doc(text)
-        tokens = _phrase_tokens(list(doc), self.text.stop_words)
-        return " ".join(tok.text for tok in tokens[:8])
-
     def _valid_phrase(self, phrase: str) -> bool:
-        """A phrase is a usable name if it reads as a specific noun phrase.
-
-        Decided from POS: it must contain a noun (so bare adjectives/verbs are
-        rejected) and a single bare structural meta-noun ("result", "form") is
-        rejected. Specific multi-word names always pass.
-        """
+        """A usable name reads as a specific noun phrase (POS-decided)."""
 
         if len(phrase) < 3:
             return False
-        content = [token for token in self.text.doc(phrase) if token.is_alpha]
-        if not content:
-            return False
-        if not any(token.pos_ in {"NOUN", "PROPN"} for token in content):
+        content = [t for t in self.text.doc(phrase) if t.is_alpha]
+        if not content or not any(t.pos_ in {"NOUN", "PROPN"} for t in content):
             return False
         if len(content) == 1 and content[0].lower_ in _META_NOUNS:
             return False
-        return any(len(token.text) >= 3 for token in content)
+        return any(len(t.text) >= 3 for t in content)
 
     @staticmethod
     def _noun_chunks(doc) -> List:
@@ -651,7 +697,33 @@ class MeaningExtractor:
 
 
 class SymbolExtractor:
-    """Extracts symbols, then only keeps paper-supported definitions."""
+    """Extracts symbols from MathML and their paper-supported definitions.
+
+    A definition is written only when the surrounding prose actually defines the
+    symbol; symbols without textual support are omitted, never guessed. The
+    search is *clause-bounded*: each sentence is split on commas/semicolons and
+    on ``where``/``with`` so a definition cannot leak across into a neighbouring
+    symbol's clause (the main failure mode of an unbounded regex). No physics
+    vocabulary is hard-coded -- only generic definitional grammar and Unicode.
+    """
+
+    # Verbs/phrases that introduce a symbol's definition in scientific prose.
+    _DEFINING = (
+        r"(?:is|are|was|were|be|denotes?|represents?|stands?\s+for|measures?|"
+        r"describes?|characteri[sz]es?|quantif(?:ies|y)|equals?|defined\s+as|"
+        r"denoted\s+by|gives?|corresponds?\s+to|refers?\s+to)"
+    )
+    # Standard operators excluded from the symbols dict (the spec exempts them).
+    _OPERATORS = {"d", "delta", "Delta", "partial", "nabla", "mathrm", "rm", "mathcal"}
+    # A captured definition is cut at the first subordinator so a trailing
+    # relative/adverbial clause does not contaminate the noun phrase.
+    _SUBORDINATORS = re.compile(
+        r"\b(?:that|which|where|when|while|whose|whom|since|because|so|thus|"
+        r"hence|if|though|although|whereas)\b",
+        re.IGNORECASE,
+    )
+    # Points at which a sentence is split into clauses.
+    _CLAUSE_SPLIT = re.compile(r"[,;:]|\b(?:where|with|which|wherein)\b", re.IGNORECASE)
 
     def __init__(self, text: TextTools) -> None:
         self.text = text
@@ -665,11 +737,10 @@ class SymbolExtractor:
     ) -> tuple[Dict[str, str], List[str]]:
         """Return paper-supported symbol definitions and the raw candidates.
 
-        Symbols come from the equation's MathML identifiers. A definition is
-        written only when the surrounding text actually defines the symbol
-        ("where X is the ...", "the ... X"); symbols without textual support are
-        omitted rather than guessed. No physics vocabulary is hard-coded -- only
-        generic definitional grammar and Unicode letter names are used.
+        The local window is searched first; for a *distinctive* symbol (a named
+        or subscripted one, which cannot be confused with an English word) the
+        whole paper is searched as a fallback to recover definitions placed far
+        from the equation.
         """
 
         symbols = self._symbols(mathml_symbols)
@@ -679,6 +750,12 @@ class SymbolExtractor:
         used: set[str] = set()
         for symbol in symbols:
             found = self._best_definition(symbol, local_sentences)
+            # Whole-paper fallback for named/Greek symbols only, and only from an
+            # explicit "where X is ..." definition. Single Latin letters are kept
+            # local because far from the equation they collide with English words
+            # and with other symbols' subscripts ("c" inside "tau_c").
+            if found is None and self._distinctive(symbol):
+                found = self._best_definition(symbol, paper_sentences, require_where=True)
             if found is None:
                 audit.add("symbol_definition", f"{symbol}: not found in paper text")
                 continue
@@ -692,172 +769,130 @@ class SymbolExtractor:
             audit.add("symbol_definition", f"{symbol}: {definition} | {short(evidence)}")
         return definitions, symbols
 
-    # Verbs/phrases that introduce a symbol's definition in scientific prose.
-    _DEFINING = (
-        r"(?:is|are|was|were|be|denotes?|denote|represents?|represent|"
-        r"stands?\s+for|measures?|describes?|characteri[sz]es?|quantif(?:ies|y)|"
-        r"gives?|corresponds?\s+to|refers?\s+to|equals?|defined\s+as|denoted\s+by)"
-    )
+    def _best_definition(
+        self, symbol: str, sentences: List[str], require_where: bool = False
+    ) -> Optional[Tuple[str, str]]:
+        """Best clause-bounded definition for a symbol among the sentences.
 
-    # Standard mathematical operators. The assignment explicitly excludes these
-    # from the symbols dict ("Mathematical standard operators (+, -, ∇, ...) are
-    # not required to be explained"); the differential/variation operators below
-    # act *on* variables rather than being variables themselves.
-    _OPERATORS = {"d", "delta", "Delta", "partial", "nabla", "mathrm", "rm", "mathcal"}
-
-    def _best_definition(self, symbol: str, sentences: List[str]) -> Optional[Tuple[str, str]]:
-        """Find the best textual definition for a symbol among the sentences."""
-
-        pattern = self._symbol_regex(symbol)
-        best: Optional[Tuple[float, str, str]] = None
-        for sentence in sentences:
-            for match in pattern.finditer(sentence):
-                definition = self._predicate_after(sentence, match.end())
-                if not definition:
-                    definition = self._appositive_before(sentence, match.start())
-                if not definition:
-                    continue
-                score = self._def_score(definition, sentence)
-                if best is None or score > best[0]:
-                    best = (score, definition, sentence)
-        if best is None:
-            best = self._dep_best(symbol, sentences, pattern)
-        if best is None:
-            return None
-        return best[1], best[2]
-
-    def _symbol_regex(self, symbol: str) -> "re.Pattern":
-        """Regex matching any surface form of the symbol (name or Unicode)."""
-
-        variants = self._surface_variants(symbol.split("_")[0])
-        alternation = "|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True))
-        return re.compile(rf"(?<![A-Za-z])(?:{alternation})(?![A-Za-z])")
-
-    @staticmethod
-    def _surface_variants(base: str) -> set:
-        """Surface forms of a symbol: its name plus Unicode Greek equivalents.
-
-        Uses ``unicodedata`` (a library, not a hand-written table) so that a
-        MathML name like ``eta`` matches the Unicode ``η``/``Η`` in the prose.
+        When ``require_where`` is set, only sentences containing an explicit
+        "where" definition are considered (used for the high-precision
+        whole-paper fallback).
         """
 
-        variants = {base}
-        upper = base.upper()
-        for template in ("GREEK SMALL LETTER {}", "GREEK CAPITAL LETTER {}", "GREEK {} SYMBOL"):
-            try:
-                variants.add(unicodedata.lookup(template.format(upper)))
-            except KeyError:
-                pass
-        return {variant for variant in variants if variant}
+        base, _, sub = symbol.partition("_")
+        pattern = self._mention_regex(_surface_variants(base))
+        bare_single = len(base) == 1 and base.isascii() and base.islower()
+        # When the symbol has an alphabetic subscript (eta_D), require that
+        # subscript in the clause so eta_D and eta_path are not confused.
+        sub_token = (
+            re.compile(rf"(?<![A-Za-z]){re.escape(sub)}(?![A-Za-z])")
+            if sub and sub.isalpha()
+            else None
+        )
 
-    def _predicate_after(self, sentence: str, pos: int) -> str:
-        """Match 'SYM (subscript)? is/denotes/... the <definition>'."""
+        best: Optional[Tuple[float, str, str]] = None
+        for sentence in sentences:
+            if require_where and not re.search(r"\bwhere\b", sentence, re.IGNORECASE):
+                continue
+            for clause in self._clauses(sentence):
+                match = pattern.search(clause)
+                if not match:
+                    continue
+                if sub_token and not sub_token.search(clause):
+                    continue
+                definition = self._predicate(clause, match.end(), sub)
+                if not definition and not bare_single:
+                    definition = self._appositive(clause, match.start())
+                if not definition:
+                    continue
+                score = self._score(definition, sentence)
+                if best is None or score > best[0]:
+                    best = (score, definition, sentence)
+        return (best[1], best[2]) if best else None
 
-        tail = sentence[pos:]
+    def _clauses(self, sentence: str) -> List[str]:
+        """Split a sentence into clauses, dropping bracketed citations first.
+
+        Removing ``[...]`` and ``(...)`` first stops citation commas
+        (``[46, 31, 47]``) and parentheticals from creating spurious clause
+        breaks before the real comma-separated definition list is split.
+        """
+
+        cleaned = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", sentence)
+        return [part.strip() for part in self._CLAUSE_SPLIT.split(cleaned) if part.strip()]
+
+    def _predicate(self, clause: str, pos: int, sub: str = "") -> str:
+        """Definition from a 'SYM (sub)? is/denotes/... (the) <noun phrase>' clause.
+
+        Only the symbol's own subscript may sit between the symbol and the verb
+        ("eta D is ..."); an arbitrary word is *not* skipped, so a single letter
+        inside another token ("delta y max is ...") cannot grab a definition.
+        """
+
+        tail = clause[pos:]
+        # Allow only the symbol's kept subscript or a short (<=2 char) index that
+        # was dropped from the key but still printed in the prose ("tau c is ...").
+        # A longer word ("delta y max is ...") is not skipped, so a single letter
+        # inside another token cannot capture a definition.
+        skip = rf"(?:{re.escape(sub)}\s+)?" if sub else r"(?:[A-Za-z0-9]{1,2}\s+)?"
         match = re.match(
-            rf"\s*(?:[A-Za-z0-9]+\s+)?(?:\([^)]*\)\s*)?{self._DEFINING}\s+"
-            r"(?:the|a|an|its|their|some)?\s*(.+?)"
-            r"(?:[,.;:]|\sand\s|\swhere\s|\swith\s|\swhich\s|\sgiven\s|$)",
+            rf"\s*{skip}{self._DEFINING}\s+"
+            r"(?:the|a|an|its|their|some)?\s*(.+)$",
             tail,
             re.IGNORECASE,
         )
         if not match:
             return ""
-        definition = self._clean_def(match.group(1))
-        return definition if self._valid_def(definition) else ""
+        phrase = self._SUBORDINATORS.split(match.group(1))[0]
+        phrase = _phrase_from_text(phrase, self.text)
+        return phrase if self._valid_def(phrase) else ""
 
-    def _appositive_before(self, sentence: str, start: int) -> str:
-        """Match a tight appositive noun phrase right before the symbol.
+    def _appositive(self, clause: str, start: int) -> str:
+        """Definition from a tight 'the <noun phrase> SYM' appositive.
 
-        Only fires for a short ``the <noun phrase> SYM`` with no intervening
-        clause or punctuation, so it cannot reach across a comma into a previous
-        symbol's definition ("... an arbitrary field, rho ...").
+        Anchored to the symbol (the phrase must end right at it), so it cannot
+        reach back across a comma into another symbol's definition.
         """
 
-        words = sentence[:start].split()
-        # Only look back a few tokens: a real appositive is adjacent to the symbol.
-        for index in range(len(words) - 1, max(-1, len(words) - 6), -1):
-            if words[index].lower() in {"the", "a", "an"}:
-                phrase_words = words[index + 1:]
-                if not 1 <= len(phrase_words) <= 4:
-                    return ""
-                if any(re.search(r"[,;:.]", word) for word in phrase_words):
-                    return ""
-                definition = self._clean_def(" ".join(phrase_words))
-                return definition if self._valid_def(definition) else ""
-        return ""
+        match = re.search(r"(?:^|\b)(?:the|a|an)\s+([A-Za-z][A-Za-z\- ]{2,40}?)\s*$", clause[:start], re.IGNORECASE)
+        if not match:
+            return ""
+        phrase = _phrase_from_text(match.group(1), self.text)
+        return phrase if self._valid_def(phrase) else ""
 
     @staticmethod
-    def _def_score(definition: str, sentence: str) -> float:
-        """Prefer compact phrases and sentences with explicit 'where' definitions."""
+    def _score(definition: str, sentence: str) -> float:
+        """Prefer compact phrases and sentences with an explicit 'where' definition."""
 
-        word_count = len(definition.split())
-        score = 1.0 if 2 <= word_count <= 6 else 0.3
+        score = 1.0 if 2 <= len(definition.split()) <= 6 else 0.4
         if re.search(r"\bwhere\b", sentence, re.IGNORECASE):
             score += 0.5
         return score
 
-    def _dep_best(self, symbol: str, sentences: List[str], pattern: "re.Pattern") -> Optional[Tuple[float, str, str]]:
-        """Dependency-parse fallback for definitions the regex patterns miss."""
+    def _mention_regex(self, variants: frozenset) -> "re.Pattern":
+        """Word-boundary regex matching any surface form of the symbol."""
 
-        variants = {variant.lower() for variant in self._surface_variants(symbol.split("_")[0])}
-        best: Optional[Tuple[float, str, str]] = None
-        for sentence in sentences:
-            if not pattern.search(sentence):
-                continue
-            for token in self.text.doc(sentence):
-                if token.text.lower() not in variants:
-                    continue
-                definition = self._clean_def(self._dep_phrase(token))
-                if not self._valid_def(definition):
-                    continue
-                score = self._def_score(definition, sentence)
-                if best is None or score > best[0]:
-                    best = (score, definition, sentence)
-        return best
-
-    def _dep_phrase(self, token) -> str:
-        """Definition phrase implied by a symbol token's syntactic role."""
-
-        if token.dep_ in {"nsubj", "nsubjpass"}:
-            for child in token.head.children:
-                if child is token:
-                    continue
-                if child.dep_ in {"attr", "oprd", "dobj", "obj"} and child.pos_ in {"NOUN", "PROPN"}:
-                    return self._chunk_text(child)
-                if child.dep_ == "prep":
-                    for grandchild in child.children:
-                        if grandchild.dep_ == "pobj" and grandchild.pos_ in {"NOUN", "PROPN"}:
-                            return self._chunk_text(grandchild)
-        if token.dep_ in {"appos", "compound", "nmod", "dep"} and token.head.pos_ in {"NOUN", "PROPN"}:
-            return self._chunk_text(token.head)
-        return ""
-
-    def _chunk_text(self, token) -> str:
-        """The full noun phrase headed by a token, including 'of'/'for' complements.
-
-        Uses the shared grammar walk so a head like "degree" keeps its complement
-        ("degree of coherence") instead of being truncated to the base chunk.
-        """
-
-        tokens = _phrase_tokens(_np_span(token), self.text.stop_words)
-        return " ".join(item.text for item in tokens[:8])
+        alternation = "|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True))
+        return re.compile(rf"(?<![A-Za-z])(?:{alternation})(?![A-Za-z])")
 
     @staticmethod
-    def _noun_chunks(doc) -> List:
-        try:
-            return list(doc.noun_chunks)
-        except ValueError:
-            return []
+    def _distinctive(symbol: str) -> bool:
+        """True if a symbol can be searched paper-wide without word collisions.
+
+        Only named/Greek symbols (a multi-letter base such as ``theta`` or a
+        Greek-letter name) qualify; single Latin letters do not, because far
+        from the equation they match ordinary words and other symbols' subscripts.
+        """
+
+        base = symbol.split("_")[0]
+        return len(base) > 1 or _is_greek_letter_name(base.lower())
 
     def _symbols(self, mathml_symbols: List[str]) -> List[str]:
         out: List[str] = []
         seen: set[str] = set()
         for raw in mathml_symbols:
             symbol = raw.strip()
-            if not self._usable_symbol(symbol):
-                continue
-            if symbol and symbol not in seen:
+            if self._usable_symbol(symbol) and symbol not in seen:
                 seen.add(symbol)
                 out.append(symbol)
         return out[:22]
@@ -865,72 +900,62 @@ class SymbolExtractor:
     def _usable_symbol(self, symbol: str) -> bool:
         if not symbol:
             return False
-        parts = symbol.split("_")
-        base = parts[0]
+        base, _, sub = symbol.partition("_")
         if base in self._OPERATORS:
             return False
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", base):
             return False
-        if len(parts) > 1 and not re.fullmatch(r"[A-Za-z][A-Za-z0-9 ]*", parts[1]):
+        if sub and not re.fullmatch(r"[A-Za-z0-9]+", sub):
             return False
         return True
 
-    def _clean_def(self, text: str) -> str:
-        """Reduce a captured phrase to a compact, math-free definition (<=8 words).
-
-        Re-parses the captured string and keeps content words with POS-based edge
-        trimming (the same path meaning extraction uses), so markup leftovers,
-        bare symbols and Greek-letter names are dropped without any hand-written
-        vocabulary list.
-        """
-
-        text = text.replace("�", " ")
-        text = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", text)
-        text = re.sub(r"\\[A-Za-z]+", " ", text)
-        text = re.sub(r"[{}_^$\\]", " ", text)
-        doc = self.text.doc(text)
-        tokens = _phrase_tokens(list(doc), self.text.stop_words)
-        return " ".join(token.text for token in tokens[:8])
+    # Finite-verb tags that mark a clause ("X equals Y", "is large when ...").
+    # Gerunds/participles (VBG/VBN) are *allowed*: they act as noun modifiers in
+    # "overcoupling coefficient", "loaded quality factor", "damping rate".
+    _FINITE_VERB_TAGS = {"VBZ", "VBP", "VBD", "VB", "MD"}
 
     def _valid_def(self, phrase: str) -> bool:
-        """A definition is usable if it reads as a specific noun phrase.
+        """A usable definition reads as a noun-headed noun phrase (POS-decided).
 
-        Decided from POS, not word lists: a definition is a noun phrase
-        ("efficiency of the detector", "bond dimension"), so it must contain a
-        noun and must not contain a verb/auxiliary (which would make it a clause
-        like "is large when ..."). A lone structural meta-noun is rejected.
+        It must contain a noun, must not contain a finite verb/auxiliary (which
+        would make it a clause, "is large when ..."), must not begin with an
+        adverb ("inversely proportional ..."), and the head noun must appear
+        early so adjectival predicates ("proportional to the FSR ...") are
+        rejected. Gerund/participle modifiers are kept (see ``_FINITE_VERB_TAGS``).
         """
 
         if len(phrase) < 3:
             return False
-        content = [token for token in self.text.doc(phrase) if token.is_alpha]
+        content = [t for t in self.text.doc(phrase) if t.is_alpha]
         if not content:
             return False
-        if any(token.pos_ in {"VERB", "AUX"} for token in content):
+        if content[0].pos_ == "ADV":
             return False
-        if not any(token.pos_ in {"NOUN", "PROPN"} for token in content):
+        if any(t.pos_ == "AUX" or t.tag_ in self._FINITE_VERB_TAGS for t in content):
+            return False
+        noun_positions = [i for i, t in enumerate(content) if t.pos_ in {"NOUN", "PROPN"}]
+        if not noun_positions or noun_positions[0] > 2:
             return False
         if len(content) == 1 and content[0].lower_ in _META_NOUNS:
             return False
-        return any(len(token.text) >= 3 for token in content)
+        return any(len(t.text) >= 3 for t in content)
 
 
 class RelationExtractor:
-    """Brute-force relations: explicit references (strong) and context similarity.
+    """Grades every ordered equation pair as strong, potential, or none.
 
-    Two low-cost, model-free signals classify each ordered equation pair, after
-    the approach surveyed by Bishop et al. (arXiv "derivation graph" study):
+    The classification concept uses two model-free signals plus an encoder:
 
-    * **Brute force** -- if one equation's context explicitly mentions the other
-      equation's number, that is a clear (``strong``) relation.
-    * **Context similarity** -- otherwise, the two equations' small extracted
-      contexts are embedded *whole* (no chunking) and compared by cosine
-      similarity, with a bonus for symbols they literally share; a high score is
-      a ``potential`` relation. This replaces the paper's character-level token
-      overlap with a semantic comparison on the surrounding prose.
+    * **strong** -- one equation's context explicitly cites the other's number
+      (an unambiguous, paper-stated link). The description is the connecting
+      verb lifted verbatim ("given by", "reduces to"), else "directly referenced".
+    * **potential** -- no explicit citation, but the two equations are topically
+      linked. Topicality is a combined score of MathBERT context cosine, shared
+      symbols, and shared context nouns (Jaccard). To avoid a brittle absolute
+      cutoff, the highest-scoring ``max_edges`` partners above a modest floor are
+      kept as potential; the rest are ``none``.
 
-    The embedding model is used only as an encoder for cosine similarity, never
-    for text generation.
+    The embedding model is used only as an encoder for cosine similarity.
     """
 
     def __init__(
@@ -938,7 +963,7 @@ class RelationExtractor:
         text: TextTools,
         similarity: "EmbeddingSimilarity",
         max_edges: int = 2,
-        threshold: float = 0.9,
+        threshold: float = 0.62,
     ) -> None:
         self.text = text
         self.similarity = similarity
@@ -946,20 +971,14 @@ class RelationExtractor:
         self.threshold = threshold
 
     def extract(self, equations: Dict[str, Dict], audits: Dict[str, AuditTrail]) -> Dict[str, Dict]:
-        """Classify every ordered pair as strong, potential, or none.
-
-        The relations dictionary for an equation contains an entry for *every*
-        other equation in the paper, as the specification requires.
-        """
+        """Classify every ordered pair; emit an entry for every other equation."""
 
         numbers = self._sort_numbers(list(equations))
-        # Embed each equation's small extracted context once -- as a whole, not
-        # chunked -- then compare contexts pairwise by cosine similarity.
-        contexts = {number: self._relation_text(equations[number]) for number in numbers}
-        semantic = self.similarity.pairwise(numbers, [contexts[number] for number in numbers])
-        context_sentences = {number: self.text.sentences(contexts[number]) for number in numbers}
-        bag_of_words = {number: self._content_lemmas(contexts[number]) for number in numbers}
-        symbol_sets = {number: self._symbol_set(equations[number]) for number in numbers}
+        contexts = {n: self._relation_text(equations[n]) for n in numbers}
+        cosine = self.similarity.pairwise(numbers, [contexts[n] for n in numbers])
+        ctx_sents = {n: self.text.sentences(contexts[n]) for n in numbers}
+        nouns = {n: self._content_lemmas(contexts[n]) for n in numbers}
+        symbols = {n: self._symbol_set(equations[n]) for n in numbers}
 
         out: Dict[str, Dict] = {}
         for left in numbers:
@@ -968,67 +987,56 @@ class RelationExtractor:
                 if left == right:
                     continue
                 grade, desc, score = self._classify(
-                    left, right, context_sentences, semantic.get((left, right), 0.0),
-                    bag_of_words, symbol_sets,
+                    left, right, ctx_sents, cosine.get((left, right), 0.0), nouns, symbols
                 )
                 scored.append((score, right, grade, desc))
 
-            potential = sorted([item for item in scored if item[2] == "potential"], reverse=True)
-            keep_potential = {right for _, right, _, _ in potential[: self.max_edges]}
-            n_strong = sum(1 for item in scored if item[2] == "strong")
+            potential = sorted([x for x in scored if x[2] == "potential"], reverse=True)
+            keep = {right for _, right, _, _ in potential[: self.max_edges]}
+            n_strong = sum(1 for x in scored if x[2] == "strong")
             rels: Dict[str, Dict[str, str]] = {}
             for score, right, grade, desc in scored:
-                final_grade, final_desc = grade, desc
-                if grade == "potential" and right not in keep_potential:
-                    final_grade, final_desc = "none", ""
-                rels[right] = {"grade": final_grade, "description": final_desc}
-                audits[left].add(
-                    "relation",
-                    f"({left})->({right}) {final_grade} score={score:.2f} {final_desc}".rstrip(),
-                )
+                if grade == "potential" and right not in keep:
+                    grade, desc = "none", ""
+                rels[right] = {"grade": grade, "description": desc}
+                audits[left].add("relation", f"({left})->({right}) {grade} score={score:.2f} {desc}".rstrip())
             out[left] = rels
-            audits[left].add(
-                "edge_limit",
-                f"kept {n_strong} strong and at most {self.max_edges} potential edges",
-            )
+            audits[left].add("edge_limit", f"kept {n_strong} strong, <= {self.max_edges} potential")
         return out
 
-    def _classify(
-        self,
-        left: str,
-        right: str,
-        context_sentences: Dict[str, List[str]],
-        semantic: float,
-        bag_of_words: Dict[str, List[str]],
-        symbol_sets: Dict[str, set],
-    ) -> Tuple[str, str, float]:
-        """Grade one ordered pair: brute-force reference first, else similarity."""
+    def _classify(self, left, right, ctx_sents, cosine, nouns, symbols) -> Tuple[str, str, float]:
+        """Grade one ordered pair: explicit reference first, else topical score."""
 
-        # Strong: an explicit textual cross-reference in either context.
         phrase = (
-            self._explicit_reference_phrase(context_sentences[left], right)
-            or self._explicit_reference_phrase(context_sentences[right], left)
+            self._explicit_reference_phrase(ctx_sents[left], right)
+            or self._explicit_reference_phrase(ctx_sents[right], left)
         )
         if phrase:
-            return "strong", phrase, 1.0 + semantic
+            return "strong", phrase, 2.0 + cosine
 
-        # Potential: high context similarity, boosted by literally shared symbols.
-        shared_symbols = symbol_sets[left] & symbol_sets[right]
-        score = semantic + 0.05 * len(shared_symbols)
+        shared = symbols[left] & symbols[right]
+        jaccard = self._jaccard(set(nouns[left]), set(nouns[right]))
+        score = cosine + 0.1 * len(shared) + 0.2 * jaccard
         if score >= self.threshold:
-            return "potential", self._overlap_description(left, right, bag_of_words, shared_symbols), score
-        return "none", "", semantic
+            return "potential", self._describe(left, right, nouns, shared), score
+        return "none", "", score
 
     @staticmethod
-    def _overlap_description(left: str, right: str, bag_of_words: Dict[str, List[str]], shared_symbols: set) -> str:
-        """Describe a potential edge by the concepts/symbols the two contexts share."""
+    def _jaccard(left: set, right: set) -> float:
+        if not left or not right:
+            return 0.0
+        return len(left & right) / len(left | right)
 
-        right_set = set(bag_of_words[right])
-        shared_terms = [word for word in bag_of_words[left] if word in right_set]
-        if shared_terms:
-            return "shared concepts: " + ", ".join(shared_terms[:3])
-        if shared_symbols:
-            return "shared symbols: " + ", ".join(sorted(shared_symbols)[:3])
+    @staticmethod
+    def _describe(left: str, right: str, nouns: Dict[str, List[str]], shared: set) -> str:
+        """Describe a potential edge by the concepts/symbols the contexts share."""
+
+        right_set = set(nouns[right])
+        common = [word for word in nouns[left] if word in right_set]
+        if common:
+            return "shared concepts: " + ", ".join(common[:3])
+        if shared:
+            return "shares symbols: " + ", ".join(sorted(shared)[:3])
         return "similar context"
 
     def _content_lemmas(self, text: str) -> List[str]:
@@ -1047,7 +1055,7 @@ class RelationExtractor:
 
     @staticmethod
     def _symbol_set(entry: Dict) -> set:
-        """Base symbols of an equation (for the shared-symbol similarity bonus)."""
+        """Base symbols of an equation (for the shared-symbol bonus)."""
 
         return {str(symbol).split("_")[0] for symbol in entry.get("_raw_symbols", [])}
 
@@ -1069,9 +1077,8 @@ class RelationExtractor:
         seen: set[Tuple[int, int]] = set()
         for pattern in patterns:
             for match in pattern.finditer(sentence):
-                span = match.span()
-                if span not in seen:
-                    seen.add(span)
+                if match.span() not in seen:
+                    seen.add(match.span())
                     out.append(match)
         return sorted(out, key=lambda item: item.start())
 
@@ -1084,17 +1091,16 @@ class RelationExtractor:
         if verb is None:
             verb = self._nearest_verb(doc, start)
         if verb is not None:
-            phrase = self._verb_phrase(verb, start, end)
+            phrase = self._verb_phrase(verb)
             if phrase:
                 return phrase
-        # An explicit citation is always a strong relation; if no relation verb
-        # or clean nearby phrase is found, fall back to a generic description
-        # rather than an uninformative lemma like "be" or "hat".
+        # An explicit citation is always a strong relation; fall back to a
+        # generic description rather than an uninformative lemma.
         return self._near_reference_phrase(doc, start, end) or "directly referenced"
 
     @staticmethod
     def _tokens_overlapping(doc, start: int, end: int) -> List:
-        return [token for token in doc if token.idx < end and token.idx + len(token.text) > start]
+        return [t for t in doc if t.idx < end and t.idx + len(t.text) > start]
 
     @staticmethod
     def _reference_anchor(tokens: List, eq_num: str):
@@ -1105,8 +1111,7 @@ class RelationExtractor:
 
     @staticmethod
     def _governing_verb(token):
-        current = token
-        seen = set()
+        current, seen = token, set()
         while current is not None and current.i not in seen:
             seen.add(current.i)
             if current.pos_ in {"VERB", "AUX"}:
@@ -1118,24 +1123,20 @@ class RelationExtractor:
 
     @staticmethod
     def _nearest_verb(doc, index: int):
-        verbs = [token for token in doc if token.pos_ in {"VERB", "AUX"}]
+        verbs = [t for t in doc if t.pos_ in {"VERB", "AUX"}]
         if not verbs:
             return None
-        return min(verbs, key=lambda token: min(abs(token.idx - index), abs(token.idx + len(token.text) - index)))
+        return min(verbs, key=lambda t: min(abs(t.idx - index), abs(t.idx + len(t.text) - index)))
 
-    def _verb_phrase(self, verb, start: int, end: int) -> str:
+    def _verb_phrase(self, verb) -> str:
         """Relation description lifted verbatim from the connecting verb.
 
-        The verb that governs the cross-reference is the relation cue ("given by",
-        "reduces to", "derived from"). A bare auxiliary ("is", "are") carries no
-        relational meaning and is rejected. An attached preposition/particle is
-        appended so the cue reads naturally -- all taken from the text, with no
-        hand-written verb mapping.
+        A bare auxiliary ("is", "are") carries no relational meaning and is
+        rejected; an attached preposition/particle is appended ("given by",
+        "reduces to"). No hand-written verb mapping.
         """
 
-        if verb.pos_ == "AUX":
-            return ""
-        if not verb.lemma_.isalpha() or len(verb.lemma_) < 3:
+        if verb.pos_ == "AUX" or not verb.lemma_.isalpha() or len(verb.lemma_) < 3:
             return ""
         parts = [verb.text]
         for child in verb.children:
@@ -1151,18 +1152,17 @@ class RelationExtractor:
         first = max(reference_tokens[0].i - 3, 0)
         last = min(reference_tokens[-1].i + 4, len(doc))
         tokens = self._description_tokens(doc[first:last], start, end)
-        return self._clean_description(" ".join(token.text for token in tokens[:8]))
+        return self._clean_description(" ".join(t.text for t in tokens[:8]))
 
     @staticmethod
     def _description_tokens(tokens: Iterable, start: int, end: int) -> List:
-        out = []
-        seen = set()
+        out, seen = [], set()
         for token in sorted(tokens, key=lambda item: item.i):
             if token.i in seen:
                 continue
             seen.add(token.i)
-            overlaps_reference = token.idx < end and token.idx + len(token.text) > start
-            if overlaps_reference or token.is_space or token.is_punct or token.like_num:
+            overlaps = token.idx < end and token.idx + len(token.text) > start
+            if overlaps or token.is_space or token.is_punct or token.like_num:
                 continue
             out.append(token)
         return out
@@ -1172,8 +1172,6 @@ class RelationExtractor:
         text = text.replace("�", " ")
         text = re.sub(r"\[[^\]]*\]", " ", text)
         text = re.sub(r"\beq(?:uation)?s?\.?\s*[\(\[\s]?\s*[A-Za-z0-9.\-]+\s*[\)\]\s]?", " ", text, flags=re.IGNORECASE)
-        # Keep only real word tokens; drop single letters, digits and math glyphs
-        # so a citation snippet like "Ĉ a i i" collapses to nothing.
         words = re.findall(r"[A-Za-z][A-Za-z\-]+", text)
         while words and words[0].lower() in {"the", "a", "an", "this", "these", "those", "that", "is", "are", "of"}:
             words.pop(0)
@@ -1181,11 +1179,7 @@ class RelationExtractor:
 
     @staticmethod
     def _relation_text(entry: Dict) -> str:
-        parts = [
-            entry.get("meaning", ""),
-            entry.get("_before", ""),
-            entry.get("_after", ""),
-        ]
+        parts = [entry.get("meaning", ""), entry.get("_before", ""), entry.get("_after", "")]
         return " ".join(part for part in parts if part)
 
     @staticmethod

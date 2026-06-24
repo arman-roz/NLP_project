@@ -301,13 +301,39 @@ def _structured_identifier(node: Tag) -> str:
 
 
 def _subscripted_identifier(node: Tag) -> str:
+    """Identifier for an ``msub``/``msubsup`` node, keeping a *semantic* subscript.
+
+    A subscript that names a quantity (``\\eta_{\\rm D}`` -> ``eta_D``,
+    ``P_{\\rm th}`` -> ``P_th``, ``I_{\\rm OFF}`` -> ``I_OFF``) is kept so that
+    physically distinct symbols sharing a base letter (``eta_D`` vs ``eta_path``)
+    stay separate in the symbols dictionary. A plain index subscript (a digit or
+    a single lower-case letter, e.g. ``x_1`` or ``\\rho_t``) carries no naming
+    information and is dropped, leaving just the base identifier.
+    """
+
     children = _element_children(node)
     if len(children) < 2:
         return ""
     base = _node_identifier(children[0], allow_text=False)
     if not base:
         return ""
-    return base
+    sub = _semantic_subscript(children[1])
+    return f"{base}_{sub}" if sub else base
+
+
+def _semantic_subscript(node: Tag) -> str:
+    """Return a subscript's letters if they name a quantity, else ``""``.
+
+    Kept when the subscript is alphabetic and either multi-letter (``th``,
+    ``eff``, ``path``, ``OFF``) or a single capital used as a label (``D``,
+    ``A``); dropped for digits and single lower-case indices (``1``, ``t``).
+    """
+
+    text = unicodedata.normalize("NFKC", _clean_text(node.get_text("", strip=True)))
+    letters = re.sub(r"[^A-Za-z]", "", text)
+    if len(letters) >= 2 or (len(letters) == 1 and letters.isupper()):
+        return letters
+    return ""
 
 
 def _node_identifier(node: Tag, allow_text: bool) -> str:
@@ -352,15 +378,6 @@ def _is_function_identifier(raw: str) -> bool:
     return raw.casefold() in {"log", "ln", "sin", "cos", "tan", "exp", "lim", "max", "min"}
 
 
-def _is_semantic_subscript(text: str) -> bool:
-    compact = re.sub(r"\s+", "", text)
-    if not compact:
-        return False
-    if compact.isdigit():
-        return False
-    return len(compact) > 1 or compact.isupper()
-
-
 def _canonical_identifier(raw: str) -> str:
     text = unicodedata.normalize("NFKC", _clean_text(raw))
     if not text or text.isdigit():
@@ -381,38 +398,6 @@ def _unicode_letter_name(char: str) -> str:
         return normalized.capitalize() if match.group(1) == "CAPITAL" else normalized
     match = re.fullmatch(r"GREEK ([A-Z]+) SYMBOL", name)
     return match.group(1).lower() if match else ""
-
-
-def _is_single_identifier(raw: str) -> bool:
-    text = unicodedata.normalize("NFKC", _clean_text(raw))
-    return len(text) == 1 and not text.isdigit()
-
-
-def _is_subscript_identifier(mi: Tag) -> bool:
-    parent = mi.parent
-    while isinstance(parent, Tag) and parent.name != "math":
-        children = _element_children(parent)
-        if parent.name == "msub" and len(children) >= 2 and _contains(children[1], mi):
-            return True
-        if parent.name == "msubsup" and len(children) >= 2 and _contains(children[1], mi):
-            return True
-        if parent.name == "mmultiscripts" and _is_mmultiscript_subscript(children, mi):
-            return True
-        parent = parent.parent
-    return False
-
-
-def _is_mmultiscript_subscript(children: List[Tag], mi: Tag) -> bool:
-    slot = 0
-    for child in children[1:]:
-        if child.name == "mprescripts":
-            slot = 0
-            continue
-        is_subscript_slot = slot % 2 == 0
-        if is_subscript_slot and _contains(child, mi):
-            return True
-        slot += 1
-    return False
 
 
 def _element_children(tag: Tag) -> List[Tag]:
